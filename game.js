@@ -3,7 +3,9 @@ import InputHandler from './input.js';
 import Replay from './replay.js';
 import { playSound, pauseBackgroundMusic, resumeBackgroundMusic, stopBackgroundMusic, playBackgroundMusic } from './audio.js';
 import * as recorder from './recorder.js';
-import confetti from 'confetti';
+import OrientationHandler from './orientation.js';
+import GameTimer from './timer.js';
+import UI from './ui.js';
 
 const config = {
     boardSize: 10,
@@ -35,21 +37,11 @@ class Game {
         this.isGameStarted = false;
 
         this.comboCount = 0;
-        this.comboDisplay = document.getElementById('combo-display');
-        this.comboTimeout = null;
-
         this.smashValue = config.initialSmashValue;
         this.smashProgress = 0; // 0, 0.5
-        this.smashValueElement = document.getElementById('smash-value');
-        this.smashFluidElement = document.getElementById('smash-fluid');
-        this.timerValue = config.timerDuration;
-        this.timerElement = document.getElementById('timer');
-        this.timerInterval = null;
-        this.isTimerPaused = false;
-        this.isRainbowMode = false;
-        this.rainbowComboTimeout = null;
-        
-        this.orientationIndicator = document.getElementById('orientation-indicator');
+        this.orientationHandler = new OrientationHandler(document.getElementById('orientation-indicator'));
+        this.timer = new GameTimer(config.timerDuration, document.getElementById('timer'), this.onTimerEnd.bind(this));
+        this.ui = new UI({ onStartGame: this.onStartGame.bind(this) });
         
         // Replay logic is now in its own class
         this.replay = new Replay(this, config);
@@ -57,11 +49,8 @@ class Game {
         
         this.inputHandler = new InputHandler(this.board.boardElement, this.onSwap.bind(this), this.onSmash.bind(this));
         
-        this.setupUI();
-        // this.setupOrientationListener(); // Will be called after permission is granted.
-        this.updateOrientationIndicator(); // Sets initial default color
-        this.updateScore(0);
-        this.updateSmashUI();
+        this.ui.updateScore(0);
+        this.ui.updateSmash(this.smashValue, this.smashProgress);
         this.initializeBoard();
     }
 
@@ -88,11 +77,16 @@ class Game {
         return type;
     }
 
+    async onStartGame() {
+        await this.orientationHandler.requestPermission();
+        this.startGame();
+    }
+
     startGame() {
         if (this.isGameStarted) return;
         this.isGameStarted = true;
 
-        document.getElementById('start-overlay').classList.add('hidden');
+        this.ui.showStartOverlay(false);
         
         playBackgroundMusic();
         recorder.startRecording(this.board.grid);
@@ -101,7 +95,7 @@ class Game {
         // Record the initial cascade as an action for the replay.
         recorder.recordAction({ type: 'initialCascade' });
 
-        this.startTimer();
+        this.timer.start();
         this.inputHandler.enable();
         
         // Process any matches that exist at the start of the game
@@ -112,146 +106,26 @@ class Game {
         }, 500); // Small delay for visual clarity
     }
 
-    async requestOrientationPermission() {
-        if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-            try {
-                const permissionState = await DeviceOrientationEvent.requestPermission();
-                if (permissionState === 'granted') {
-                    this.setupOrientationListener();
-                } else {
-                    console.warn('Permission for device orientation not granted. Falling back to screen.orientation API.');
-                    this.setupOrientationListener(true); // Fallback
-                }
-            } catch (error) {
-                console.error('Error requesting device orientation permission:', error);
-                this.setupOrientationListener(true); // Fallback on error
-            }
+    onTimerEnd() {
+        if (this.smashValue > 0) {
+            this.smashValue--;
+            this.ui.updateSmash(this.smashValue, this.smashProgress);
         } else {
-            // For browsers that don't require permission or don't have the API
-            this.setupOrientationListener();
+            // Game over / round over condition
+            recorder.resetRecording();
+            this.isRecordingStarted = false;
         }
-    }
-
-    setupOrientationListener(useScreenApi = false) {
-        if (!useScreenApi && window.DeviceOrientationEvent) {
-             window.addEventListener('deviceorientation', (event) => this.updateOrientationIndicator(event));
-        } else if (window.screen && window.screen.orientation) {
-            try {
-                 window.screen.orientation.addEventListener('change', () => this.updateOrientationIndicator());
-            } catch(e) {
-                console.warn("screen.orientation.addEventListener is not supported, falling back to onchange");
-                window.screen.orientation.onchange = () => this.updateOrientationIndicator();
-            }
-        } else {
-            // Fallback for older browsers/devices
-            window.addEventListener('orientationchange', () => this.updateOrientationIndicator());
-        }
-    }
-
-    updateOrientationIndicator(event) {
-        let color = '#ccc'; // Default color
-        let orientationType = 'unknown';
-
-        if (event && typeof event.beta === 'number' && typeof event.gamma === 'number') {
-            const { beta, gamma } = event;
-            const threshold = 45;
-
-            // Determine if it's primarily landscape or portrait by seeing which angle is more pronounced
-            if (Math.abs(gamma) > Math.abs(beta)) {
-                // Landscape mode
-                if (gamma > threshold) {
-                    orientationType = 'landscape-secondary'; // Rotated right (yellow)
-                } else if (gamma < -threshold) {
-                    orientationType = 'landscape-primary'; // Rotated left (green)
-                }
-            } else {
-                // Portrait mode
-                if (beta > threshold && beta < 135) {
-                    orientationType = 'portrait-primary'; // Upright (blue)
-                } else if (beta < -threshold && beta > -135) {
-                    orientationType = 'portrait-secondary'; // Upside down (red)
-                }
-            }
-        } else {
-             // Fallback to screen.orientation if gyroscope data is not available
-            orientationType = window.screen.orientation ? window.screen.orientation.type : this.getLegacyOrientation();
-        }
-
-        switch (orientationType) {
-            case 'portrait-primary':
-                color = '#4285F4'; // Blue
-                break;
-            case 'landscape-primary':
-                color = '#34A853'; // Green
-                break;
-            case 'portrait-secondary':
-                color = '#EA4335'; // Red
-                break;
-            case 'landscape-secondary':
-                color = '#FBBC05'; // Yellow
-                break;
-        }
-        
-        if (this.orientationIndicator) {
-            this.orientationIndicator.style.backgroundColor = color;
-        }
-    }
-
-    getLegacyOrientation() {
-        if (typeof window.orientation === 'undefined') return 'portrait-primary'; // Default for desktop
-        
-        if (window.orientation === 0) {
-            return 'portrait-primary';
-        } else if (window.orientation === 90) {
-            return 'landscape-primary';
-        } else if (window.orientation === 180) {
-            return 'portrait-secondary';
-        } else if (window.orientation === -90 || window.orientation === 270) {
-            return 'landscape-secondary';
-        }
-        return 'portrait-primary';
-    }
-
-    setupUI() {
-        document.getElementById('start-button').addEventListener('click', async () => {
-            await this.requestOrientationPermission();
-            this.startGame();
-        });
-    }
-
-    startTimer() {
-        this.timerInterval = setInterval(() => {
-            if (this.isTimerPaused) return;
-
-            this.timerValue--;
-            this.timerElement.textContent = this.timerValue;
-            if (this.timerValue <= 0) {
-                if (this.smashValue > 0) {
-                    this.smashValue--;
-                    this.updateSmashUI();
-                } else {
-                    // Game over / round over condition
-                    recorder.resetRecording();
-                    this.isRecordingStarted = false;
-                }
-                this.smashProgress = 0; // Reset progress if timer runs out
-                this.updateSmashUI();
-                this.resetTimer();
-            }
-        }, 1000);
-    }
-
-    resetTimer() {
-        this.timerValue = config.timerDuration;
-        this.timerElement.textContent = this.timerValue;
+        this.smashProgress = 0; // Reset progress if timer runs out
+        this.ui.updateSmash(this.smashValue, this.smashProgress);
+        this.timer.reset();
     }
 
     pauseTimer() {
-        this.isTimerPaused = true;
+        this.timer.pause();
     }
 
     resumeTimer() {
-        this.isTimerPaused = false;
+        this.timer.resume();
     }
 
     // Add BGM control methods for the replay module to call
@@ -263,37 +137,11 @@ class Game {
         resumeBackgroundMusic();
     }
 
-    updateComboUI() {
-        if (this.comboCount < 2) {
-            if (!this.isRainbowMode) {
-                this.comboDisplay.classList.remove('visible');
-            }
-            return;
-        }
+    // removed function updateComboUI() {}
 
-        this.comboDisplay.textContent = `Combo x${this.comboCount}`;
-        this.comboDisplay.classList.add('visible');
+    // removed function updateSmashUI() {}
 
-        if (!this.isRainbowMode) {
-            clearTimeout(this.comboTimeout);
-            this.comboTimeout = setTimeout(() => {
-                this.comboDisplay.classList.remove('visible');
-            }, 1500);
-        } else {
-            clearTimeout(this.comboTimeout); // Ensure normal timeout is cleared
-        }
-    }
-
-    updateSmashUI() {
-        this.smashValueElement.textContent = this.smashValue;
-        const fillPercentage = this.smashProgress * 100; // 0 or 50
-        this.smashFluidElement.style.height = `${fillPercentage}%`;
-    }
-
-    updateScore(points) {
-        this.score += points;
-        this.scoreElement.textContent = this.score;
-    }
+    // removed function updateScore() {}
 
     onMatch(matchedCandies, isPlayerMove) {
         if (this.isRainbowMode) {
@@ -302,11 +150,12 @@ class Game {
 
         playSound('match.mp3');
         recorder.recordSound('match.mp3');
-        this.updateScore(matchedCandies.length * config.pointsPerCandy);
+        this.score += matchedCandies.length * config.pointsPerCandy;
+        this.ui.updateScore(this.score);
         
         this.comboCount++;
         if (this.isRecordingStarted) recorder.recordAction({ type: 'comboUpdate', count: this.comboCount });
-        this.updateComboUI();
+        this.ui.updateCombo(this.comboCount, this.isRainbowMode);
 
         if (this.comboCount >= 7 && !this.isRainbowMode) {
             this.startRainbowMode();
@@ -334,44 +183,28 @@ class Game {
         
         if (isPlayerMove) {
             this.smashProgress += 0.5;
-            this.updateSmashUI();
+            this.ui.updateSmash(this.smashValue, this.smashProgress);
 
             if (this.smashProgress >= 1) {
-                // Animate fill, update value, then animate empty
-                this.smashFluidElement.style.transition = 'height 0.3s ease-in';
-                this.smashFluidElement.style.height = '100%';
-
-                setTimeout(() => {
+                this.ui.fillAndResetSmash(() => {
                     if (this.smashValue < 12) {
                         this.smashValue++;
                     }
-                    this.smashValueElement.textContent = this.smashValue;
                     this.smashProgress = 0;
-                    
-                    setTimeout(() => {
-                        this.smashFluidElement.style.transition = 'height 0.5s ease-out';
-                        this.updateSmashUI();
-                    }, 200); // Wait a moment before draining
-                }, 300); // Duration of the fill animation
+                });
             }
             
-            this.resetTimer();
+            this.timer.reset();
         }
 
         if (matchedCandies.length >= 5) {
-            confetti({
-                particleCount: 150,
-                spread: 70,
-                origin: { y: 0.6 }
-            });
+            this.ui.showConfetti();
         }
     }
 
     startRainbowMode() {
         this.isRainbowMode = true;
-        document.getElementById('game-board-container').classList.add('rainbow-mode');
-        this.comboDisplay.classList.add('rainbow');
-        clearTimeout(this.comboTimeout);
+        this.ui.toggleRainbowMode(true);
         playSound('smash_success.mp3');
         recorder.recordSound('smash_success.mp3');
         recorder.recordAction({ type: 'startRainbow' });
@@ -379,9 +212,7 @@ class Game {
 
     endRainbowMode() {
         this.isRainbowMode = false;
-        document.getElementById('game-board-container').classList.remove('rainbow-mode');
-        this.comboDisplay.classList.remove('rainbow');
-        this.comboDisplay.classList.remove('visible');
+        this.ui.toggleRainbowMode(false);
         this.comboCount = 0;
         if (this.isRecordingStarted) recorder.recordAction({ type: 'comboUpdate', count: this.comboCount });
         clearTimeout(this.rainbowComboTimeout);
@@ -437,7 +268,7 @@ class Game {
         if (this.isRecordingStarted) recorder.recordAction({ type: 'smash', smashed: smashedCoords });
 
         this.smashValue -= smashCost;
-        this.updateSmashUI();
+        this.ui.updateSmash(this.smashValue, this.smashProgress);
         playSound('smash.mp3');
         recorder.recordSound('smash.mp3');
         
